@@ -63,6 +63,7 @@ interface UniqueState {
   effMs: number;
   u: number;
   players: number;
+  earned: number;
   rates: Array<number | null>;
 }
 
@@ -94,6 +95,8 @@ const round4 = (x: number): number => {
 
 const Z_FLOOR = logitPct(0.01);
 const Z_CEIL = logitPct(99.99);
+const Z_WAKE = logitPct(0.058);
+const SQRT3 = Math.sqrt(3);
 
 function safePlayers(n: unknown): number {
   return typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : 1;
@@ -102,6 +105,22 @@ function safePlayers(n: unknown): number {
 function safeRate(r: unknown): number | null {
   if (typeof r !== 'number' || !Number.isFinite(r)) return null;
   return clamp(r, 0, 100);
+}
+
+function safeEarned(read: HistoryRead, players: number, rates: Array<number | null>): number {
+  if (
+    typeof read.trophies_earned === 'number' &&
+    Number.isFinite(read.trophies_earned) &&
+    read.trophies_earned >= 0
+  ) {
+    return read.trophies_earned;
+  }
+  let sum = 0;
+  for (let i = 0; i < rates.length; i++) {
+    const r = safeRate(rates[i]);
+    if (r !== null) sum += (players * r) / 100;
+  }
+  return sum;
 }
 
 function toLogTime(ms: number): number {
@@ -155,13 +174,16 @@ function buildUniqueStates(history: HistoryRead[]): UniqueState[] {
     if (prevRead !== null && sameState(prevRead, read)) {
       states[states.length - 1].lastMs = ms;
     } else {
+      const players = safePlayers(read.players_tracked);
+      const rates = Array.isArray(read.rates) ? read.rates : [];
       states.push({
         firstMs: ms,
         lastMs: ms,
         effMs: ms,
         u: 0,
-        players: safePlayers(read.players_tracked),
-        rates: Array.isArray(read.rates) ? read.rates : [],
+        players,
+        earned: safeEarned(read, players, rates),
+        rates,
       });
     }
     prevRead = read;
@@ -249,6 +271,10 @@ function classifyTrophy(t: TrophyMeta): Category {
   }
 
   return 'action_misc';
+}
+
+function studentT3Cdf(x: number): number {
+  return 0.5 + (Math.atan(x / SQRT3) + (x * SQRT3) / (x * x + 3)) / Math.PI;
 }
 
 function studentT4Cdf(x: number): number {
@@ -371,7 +397,7 @@ function forecastCase(c: CaseFile): ForecastRow[] {
     return rows;
   }
 
-  // Regime 2: Multi-state decoupled N(t) & E_i(t) log-time OLS + split EB + 5-regime hurdle Student-t4.
+  // Regime 2: Multi-state decoupled N(t), M(t) & E_i(t) log-time OLS + dual-mechanism EB + 5-regime hurdle Student-t3/t4.
   const m = fitStates.length;
   const uFirst = fitStates[0].u;
   const uLast = fitStates[m - 1].u;
@@ -382,6 +408,7 @@ function forecastCase(c: CaseFile): ForecastRow[] {
   // Reusable typed buffers & precomputed recency weights across fitStates.
   const xsBuf = new Float64Array(m);
   const ysBuf = new Float64Array(m);
+  const zsBuf = new Float64Array(m);
   const wsBuf = new Float64Array(m);
   const recencyW = new Float64Array(m);
 
@@ -400,7 +427,18 @@ function forecastCase(c: CaseFile): ForecastRow[] {
   const dampN = 1 / (1 + 0.12 * du);
   const dampE = 1 / (1 + 0.08 * du);
 
-  // Per-trophy raw E_i(t) fits and classifications.
+  // Macro Progression Index M(t) using the same u and recency/drop-penalized weights wsBuf as N(t).
+  for (let j = 0; j < m; j++) {
+    const st = fitStates[j];
+    const nVal = safePlayers(st.players);
+    const mVal = Math.max(0.05, (Math.max(nVal, st.earned) - nVal) / nVal);
+    ysBuf[j] = Math.log(mVal);
+  }
+  const mOls = weightedOLS(xsBuf, ysBuf, wsBuf, m, 0.22);
+  const mSlope = mOls.valid ? mOls.slope : 0.55;
+  const mDrive = clamp(1 + 0.45 * (mSlope - 0.55), 0.55, 1.65);
+
+  // Per-trophy raw E_i(t) & logit-link fits and classifications.
   interface TrophyFitInfo {
     rNow: number;
     eNowRaw: number;
@@ -409,6 +447,8 @@ function forecastCase(c: CaseFile): ForecastRow[] {
     activeGrower: boolean;
     hasSlope: boolean;
     rawSlope: number;
+    hasZSlope: boolean;
+    rawZSlope: number;
     resid: number;
     infoWeight: number;
     kEff: number;
@@ -417,8 +457,12 @@ function forecastCase(c: CaseFile): ForecastRow[] {
   const fits: TrophyFitInfo[] = new Array(c.trophies.length);
   let globalSlopeNum = 0;
   let globalSlopeDen = 0;
+  let globalZSlopeNum = 0;
+  let globalZSlopeDen = 0;
   const groupNum = new Map<string, number>();
   const groupDen = new Map<string, number>();
+  const groupZNum = new Map<string, number>();
+  const groupZDen = new Map<string, number>();
 
   for (let i = 0; i < c.trophies.length; i++) {
     const t = c.trophies[i];
@@ -442,6 +486,8 @@ function forecastCase(c: CaseFile): ForecastRow[] {
 
     let hasSlope = false;
     let rawSlope = 0;
+    let hasZSlope = false;
+    let rawZSlope = 0;
     let resid = 0.22;
     let infoWeight = 0;
     let validCount = 0;
@@ -453,10 +499,12 @@ function forecastCase(c: CaseFile): ForecastRow[] {
         const eMid = Math.max(0, (fitStates[j].players * rj) / 100);
         xsBuf[validCount] = fitStates[j].u;
         ysBuf[validCount] = Math.log(Math.max(0.35, eMid));
+        zsBuf[validCount] = logitPct(rj);
         wsBuf[validCount] = recencyW[j] * Math.max(0.08, eMid / (eMid + 4));
         validCount++;
       }
       const eOls = weightedOLS(xsBuf, ysBuf, wsBuf, validCount, 0.22);
+      const zOls = weightedOLS(xsBuf, zsBuf, wsBuf, validCount, 0.22);
       resid = eOls.resid;
       if (eOls.valid) {
         hasSlope = true;
@@ -468,6 +516,15 @@ function forecastCase(c: CaseFile): ForecastRow[] {
         globalSlopeDen += infoWeight;
         groupNum.set(gKey, (groupNum.get(gKey) ?? 0) + infoWeight * rawSlope);
         groupDen.set(gKey, (groupDen.get(gKey) ?? 0) + infoWeight);
+
+        if (zOls.valid) {
+          hasZSlope = true;
+          rawZSlope = clamp(zOls.slope, -0.8, 3.8);
+          globalZSlopeNum += infoWeight * rawZSlope;
+          globalZSlopeDen += infoWeight;
+          groupZNum.set(gKey, (groupZNum.get(gKey) ?? 0) + infoWeight * rawZSlope);
+          groupZDen.set(gKey, (groupZDen.get(gKey) ?? 0) + infoWeight);
+        }
       }
     } else {
       for (let j = 0; j < m; j++) {
@@ -483,6 +540,8 @@ function forecastCase(c: CaseFile): ForecastRow[] {
       activeGrower,
       hasSlope,
       rawSlope,
+      hasZSlope,
+      rawZSlope,
       resid,
       infoWeight,
       kEff: Math.max(1, validCount),
@@ -490,6 +549,7 @@ function forecastCase(c: CaseFile): ForecastRow[] {
   }
 
   const globalMeanSlope = globalSlopeDen > 0 ? globalSlopeNum / globalSlopeDen : nSlope;
+  const globalZPrior = globalZSlopeDen > 0 ? globalZSlopeNum / globalZSlopeDen : 0.4;
 
   // Precompute all shared 5-scenario quantities once per case outside the trophy loop.
   const hMacro = Math.min(1, Math.sqrt(hDays / 4));
@@ -497,6 +557,21 @@ function forecastCase(c: CaseFile): ForecastRow[] {
     0.06,
     0.14 * sqrtHDays + 0.32 * nResid * Math.sqrt(Math.max(0.15, du / Math.max(0.05, uLast - uFirst))),
   );
+
+  const tilt = (mDrive - 1) * 0.06;
+  const wRaw0 = Math.max(0.06, SCENARIO_WEIGHTS[0] - tilt);
+  const wRaw1 = Math.max(0.12, SCENARIO_WEIGHTS[1] - 0.5 * tilt);
+  const wRaw2 = SCENARIO_WEIGHTS[2];
+  const wRaw3 = SCENARIO_WEIGHTS[3];
+  const wRaw4 = Math.max(0.08, SCENARIO_WEIGHTS[4] + 1.5 * tilt);
+  const wSum = wRaw0 + wRaw1 + wRaw2 + wRaw3 + wRaw4;
+  const scenarioWeights = new Float64Array([
+    wRaw0 / wSum,
+    wRaw1 / wSum,
+    wRaw2 / wSum,
+    wRaw3 / wSum,
+    wRaw4 / wSum,
+  ]);
 
   const ve = [
     1 - 0.42 * hMacro,
@@ -517,12 +592,18 @@ function forecastCase(c: CaseFile): ForecastRow[] {
 
   const nScenarios = new Float64Array(NUM_SCENARIOS);
   const veDuDampE = new Float64Array(NUM_SCENARIOS);
+  const veDuDampZ = new Float64Array(NUM_SCENARIOS);
+  const directShift = new Float64Array(NUM_SCENARIOS);
   const zeroHurdleShift = new Float64Array(NUM_SCENARIOS);
+  const dampZ = 1 / (1 + 0.06 * du);
   const duDampN = du * dampN;
   const duDampE = du * dampE;
+  const duDampZ = du * dampZ;
   for (let s = 0; s < NUM_SCENARIOS; s++) {
     nScenarios[s] = Math.max(1, nLast * Math.exp(nSlope * vn[s] * duDampN + dn[s]));
     veDuDampE[s] = ve[s] * duDampE;
+    veDuDampZ[s] = ve[s] * duDampZ;
+    directShift[s] = 0.75 * de[s] - 0.35 * dn[s];
     zeroHurdleShift[s] = 0.6 * de[s] - 0.6 * dn[s] + 0.3 * Math.log(Math.max(0.2, ve[s]));
   }
 
@@ -531,7 +612,7 @@ function forecastCase(c: CaseFile): ForecastRow[] {
   const stickyHorizonScale = Math.min(1, hDays / 2.5);
   const zSc = new Float64Array(NUM_SCENARIOS);
 
-  // Forecast each trophy via hurdle mixture + 5-regime Student-t(df=4) CDF inversion.
+  // Forecast each trophy via hurdle mixture + 5-regime Student-t(df=3/4) CDF inversion.
   const rows: ForecastRow[] = new Array(c.trophies.length);
 
   for (let i = 0; i < c.trophies.length; i++) {
@@ -543,7 +624,7 @@ function forecastCase(c: CaseFile): ForecastRow[] {
       continue;
     }
 
-    // Empirical-Bayes shrunk slope.
+    // Empirical-Bayes shrunk slopes (earner count & logit link).
     const gKey = `${f.category}:${f.activeGrower ? 'active' : 'stagnant'}`;
     const gNum = groupNum.get(gKey) ?? 0;
     const gDen = groupDen.get(gKey) ?? 0;
@@ -558,6 +639,17 @@ function forecastCase(c: CaseFile): ForecastRow[] {
     }
     const slI = Math.max(0, Math.min(slEb, nSlope + 3.6 * Math.max(0.05, 1 - f.rNow / 100)));
 
+    const gZNum = groupZNum.get(gKey) ?? 0;
+    const gZDen = groupZDen.get(gKey) ?? 0;
+    let priorZ = (gZNum + 1.0 * globalZPrior) / (gZDen + 1.0);
+    if (f.category === 'story_secret' && f.activeGrower && f.rNow <= 0.05) {
+      priorZ = Math.max(priorZ, 0.75);
+    }
+    const slZEb = f.hasZSlope
+      ? (f.infoWeight * f.rawZSlope + TAU_EB * priorZ) / (f.infoWeight + TAU_EB)
+      : priorZ;
+    const slZ = clamp(slZEb, -0.5, 3.2);
+
     // Count & base uncertainty.
     const eLo = (Math.max(0, f.rNow - 0.005) / 100) * nLast;
     const eHi = (Math.min(100, f.rNow + 0.005) / 100) * nLast;
@@ -568,23 +660,22 @@ function forecastCase(c: CaseFile): ForecastRow[] {
     );
 
     if (f.rNow <= 0.005) {
-      // Zero hurdle mixture.
+      // Zero hurdle mixture (df=4) with M-driven breakout scaling.
       const descLower = (t.description ?? '').toLowerCase();
-      let pBase = 0.58;
+      let pBreak = Math.min(0.85, 0.58 * mDrive * breakHorizonScale);
       let zCondBase = logitPct(0.055);
       let condSig = 0.95;
 
       if (f.category === 'platinum') {
-        pBase = 0.12;
+        pBreak = Math.min(0.45, 0.12 * mDrive * breakHorizonScale);
         zCondBase = logitPct(0.022);
         condSig = 0.65;
       } else if (descLower.includes('100%')) {
-        pBase = 0.40;
+        pBreak = Math.min(0.75, 0.40 * mDrive * breakHorizonScale);
         zCondBase = logitPct(0.04);
         condSig = 0.85;
       }
 
-      const pBreak = pBase * breakHorizonScale;
       const invCondSig = 1 / condSig;
       for (let s = 0; s < NUM_SCENARIOS; s++) {
         zSc[s] = zCondBase + zeroHurdleShift[s];
@@ -593,7 +684,7 @@ function forecastCase(c: CaseFile): ForecastRow[] {
       const cdf = (z: number): number => {
         let sum = 0;
         for (let s = 0; s < NUM_SCENARIOS; s++) {
-          sum += SCENARIO_WEIGHTS[s] * studentT4Cdf((z - zSc[s]) * invCondSig);
+          sum += scenarioWeights[s] * studentT4Cdf((z - zSc[s]) * invCondSig);
         }
         return (1 - pBreak) + pBreak * sum;
       };
@@ -603,9 +694,12 @@ function forecastCase(c: CaseFile): ForecastRow[] {
     }
 
     if (f.rNow <= 0.025 && !f.activeGrower) {
-      // Stagnant ultra-rare sticky-floor mixture.
-      const stickyFloorP =
+      // Stagnant ultra-rare sticky-floor + M-driven wake-up mixture (df=3).
+      const rawStickyFloorP =
         0.34 * Math.exp(-1.2 * Math.max(0, slI - 0.35 * nSlope)) * stickyHorizonScale;
+      const wakeP = 0.05 * breakHorizonScale * mDrive;
+      const stickyFloorP = Math.max(0, rawStickyFloorP * (1 - wakeP));
+      const dynW = Math.max(0.05, 1 - stickyFloorP - wakeP);
       const invEffSig = 1 / Math.max(0.28, trophySig * 1.15);
       const minE = 0.8 * f.eNowRaw;
       for (let s = 0; s < NUM_SCENARIOS; s++) {
@@ -619,28 +713,36 @@ function forecastCase(c: CaseFile): ForecastRow[] {
       const cdf = (z: number): number => {
         let scSum = 0;
         for (let s = 0; s < NUM_SCENARIOS; s++) {
-          scSum += SCENARIO_WEIGHTS[s] * studentT4Cdf((z - zSc[s]) * invEffSig);
+          scSum += scenarioWeights[s] * studentT3Cdf((z - zSc[s]) * invEffSig);
         }
-        return stickyFloorP * studentT4Cdf((z - Z_FLOOR) * 4) + (1 - stickyFloorP) * scSum;
+        const floorComp = studentT3Cdf((z - Z_FLOOR) * 4);
+        const wakeComp = studentT3Cdf((z - Z_WAKE) / 0.9);
+        return Math.min(1, stickyFloorP * floorComp + wakeP * wakeComp + dynW * scSum);
       };
 
       rows[i] = { id: t.id, q: invertCdfQuantiles(cdf) };
       continue;
     }
 
-    // Standard multi-scenario Student-t4 mixture.
+    // Standard multi-scenario dual-mechanism (count + logit-link) Student-t(df=3/4) mixture.
     const invEffSig = 1 / (trophySig * (f.rNow <= 0.15 ? 1.16 : 1));
     const eAnchor = Math.max(1e-6, f.eNowRaw);
+    const zNow = logitPct(f.rNow);
+    const wDir = f.rNow > 0.10 ? 0.34 : 0.24;
+    const oneMinusWDir = 1 - wDir;
     for (let s = 0; s < NUM_SCENARIOS; s++) {
       const eProj = eAnchor * Math.exp(slI * veDuDampE[s] + de[s]);
       const pSc = clamp(eProj / nScenarios[s], 0.0001, 0.9999);
-      zSc[s] = Math.log(pSc / (1 - pSc));
+      const zCount = Math.log(pSc / (1 - pSc));
+      const zDirect = zNow + slZ * veDuDampZ[s] + directShift[s];
+      zSc[s] = clamp(oneMinusWDir * zCount + wDir * zDirect, Z_FLOOR, Z_CEIL);
     }
 
+    const tailCdf = f.rNow <= 0.15 ? studentT3Cdf : studentT4Cdf;
     const cdf = (z: number): number => {
       let scSum = 0;
       for (let s = 0; s < NUM_SCENARIOS; s++) {
-        scSum += SCENARIO_WEIGHTS[s] * studentT4Cdf((z - zSc[s]) * invEffSig);
+        scSum += scenarioWeights[s] * tailCdf((z - zSc[s]) * invEffSig);
       }
       return scSum;
     };
